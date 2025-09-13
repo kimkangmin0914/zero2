@@ -1,0 +1,6 @@
+streamlit==1.37.1
+pandas>=2.1
+numpy>=1.26
+ortools>=9.9
+openpyxl>=3.1
+xlsxwriter>=3.2
