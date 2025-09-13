@@ -307,7 +307,7 @@ if st.session_state.get("assignment_ready", False):
             st.session_state.team_idx = (st.session_state.team_idx - 1) % st.session_state.team_count
             st.session_state.final_view = False
     with col2:
-        st.markdown(f"<div class='team-title'>{st.session_state.team_idx+1}팀</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)  # (중앙 인디케이터 제거)
     with col3:
         if st.button("다음 팀 ▶", key="next_team"):
             if st.session_state.team_idx < st.session_state.team_count - 1:
