@@ -4,6 +4,7 @@ import io
 import math
 import random
 import pandas as pd
+import numpy as np
 import streamlit as st
 from ortools.sat.python import cp_model
 
@@ -41,7 +42,7 @@ def hangul_key(s: str):
 # ------------------------------
 # 유틸: 데이터 전처리
 # ------------------------------
-AGE_BANDS = ["10대","20대","30대","40대","50대","60대","70대"]
+AGE_BANDS = ["10대","20대","30대","40대","50대","60대+"]
 
 def age_to_band(age: int) -> str:
     try:
@@ -58,9 +59,7 @@ def age_to_band(age: int) -> str:
         return "40대"
     if a < 60:
         return "50대"
-    if a < 70:
-        return "60대"
-    return "70대"
+    return "60대+"
 
 def normalize_gender(x):
     if pd.isna(x):
@@ -73,39 +72,26 @@ def normalize_gender(x):
     return None
 
 # ------------------------------
-# 그룹 크기 결정: 7명 기본, 6~8명 허용, 6/8인 조는 최대 4개
+# 그룹 크기 결정: 6명 고정
 # ------------------------------
 def choose_group_sizes(N: int, max_offsize: int = 4):
-    best = None
-    target_T = int(round(N/7))
-    for x6 in range(0, max_offsize+1):
-        for x8 in range(0, max_offsize - x6 + 1):
-            rem = N - (6*x6 + 8*x8)
-            if rem < 0:
-                continue
-            if rem % 7 != 0:
-                continue
-            x7 = rem // 7
-            T = x6 + x7 + x8
-            off = x6 + x8
-            score = (abs(T - target_T), off, abs(x8 - x6))
-            cand = (score, x6, x7, x8)
-            if best is None or cand < best:
-                best = cand
-    if best is None:
-        return None, f"해결 실패: 6/7/8인 조의 조합으로 총원 {N}명을 구성할 수 없습니다."
-    else:
-        (_, x6, x7, x8) = best
-        sizes = [6]*x6 + [7]*x7 + [8]*x8
-        return sizes, None
+    # 6인 고정. 총 인원이 6의 배수가 아니면 중단.
+    if N % 6 != 0:
+        need = 6 - (N % 6)
+        if need == 6:
+            need = 0
+        msg = (
+            f"해결 실패: 6인 고정 규칙상 총원 {N}명은 6의 배수여야 합니다. "
+            f"±{need if need!=0 else 6}명 조정 후 다시 시도하세요."
+        )
+        return None, msg
+    G = N // 6
+    sizes = [6] * G
+    return sizes, None
 
 def allowed_male_bounds(size):
-    if size == 7: return 3,4
-    if size == 6: return 2,4
-    if size == 8: return 3,5
-    lo = int(math.floor(0.4*size))
-    hi = int(math.ceil(0.6*size))
-    return lo, hi
+    # 6인 전용: 남 2~4 허용
+    return 2, 4
 
 # ------------------------------
 # OR-Tools CP-SAT 모델
@@ -130,23 +116,19 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
     bands = AGE_BANDS
     band_members = {b: [i for i,p in enumerate(people) if p['나이대'] == b] for b in bands}
 
-    # 나이대 초과분 계산(기본 2/팀, 불가피 시 3 허용)
-    age_counts = {b: len(members) for b, members in band_members.items()}
-    age_extra_needed = {b: max(0, cnt - 2*G) for b, cnt in age_counts.items()}
-
     # 사전 타당성: 교회/나이대 인원수가 max_per_church*G 초과면 불가능
     overload = []
     for c, members in church_members.items():
         if len(members) > max_per_church*G:
             overload.append((c, len(members), max_per_church*G))
     if overload:
-        msg = f"불가능: 일부 교회 인원이 너무 많아(최대 {max_per_church}명/팀) 배치가 불가합니다.\n" + \
+        msg = "불가능: 일부 교회 인원이 너무 많아(최대 {max_per_church}명/팀) 배치가 불가합니다.\n" + \
               "\n".join([f" - {c}: {cnt}명 > 허용 {cap}명" for c,cnt,cap in overload])
         return None, None, msg, None
     for b, members in band_members.items():
-        if len(members) > 3*G:  # 나이대는 기존 2명 유지
+        if len(members) > 2*G:  # 나이대는 기존 2명 유지
             msg = "불가능: 일부 나이대 인원이 너무 많아(최대 2명/팀) 배치가 불가합니다.\n" + \
-                  "\n".join([f" - {b}: {len(band_members[b])}명 > 허용 {3*G}명"])
+                  "\n".join([f" - {b}: {len(band_members[b])}명 > 허용 {2*G}명"])
             return None, None, msg, None
 
     model = cp_model.CpModel()
@@ -183,6 +165,10 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
     # 기본 목표는 팀당 <=2, 불가피한 경우에만 3·4 허용(정확히 필요한 만큼만)
     church_is3_flags = []  # cnt==3
     church_is4_flags = []  # cnt==4
+    church_extras_sum = [] # z = is3 + 2*is4 (팀별 초과합)
+    for g in range(G):
+        pass  # placeholder to keep loop variable available
+
     # Per-church per-team variables
     church_cnt = {}  # (c,g) -> IntVar
     church_z = {}    # (c,g) -> IntVar in [0,2]
@@ -249,10 +235,6 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
-    try:
-        solver.parameters.random_seed = int(seed)
-    except Exception:
-        pass
 
     res = solver.Solve(model)
     if res not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
