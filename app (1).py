@@ -4,7 +4,6 @@ import io
 import math
 import random
 import pandas as pd
-import numpy as np
 import streamlit as st
 from ortools.sat.python import cp_model
 
@@ -12,62 +11,12 @@ from ortools.sat.python import cp_model
 # Page setup + CSS
 # ------------------------------
 st.set_page_config(page_title="교회 매칭 프로그램 (팀 번호 + 이름만)", layout="wide")
-st.markdown(f"""
+st.markdown("""
 <style>
-:root {{
-  --brand:#2e5a88; --brand-2:#3a7ca5; --bg1:#f5f8fc; --bg2:#eaf2fb; --text:#1b365d; --muted:#7a8ca3;
-}}
-html, body, [data-testid="stAppViewContainer"] {{
-  background: linear-gradient(180deg, var(--bg1), var(--bg2));
-  color: var(--text);
-}}
-/* Container width & spacing */
-.block-container {{
-  padding-top: 1rem;
-  padding-bottom: 2rem;
-  max-width: 1100px;
-}}
-/* Header */
-.app-header {{
-  text-align:center; margin: 6px 0 10px 0;
-}}
-.app-header h1 {{
-  font-weight: 800; letter-spacing: 0.3px; margin: 0; color: var(--brand);
-}}
-.app-sub {{
-  text-align:center; color: var(--muted); margin-bottom: 18px;
-}}
-/* Cards */
-.card, .big-card, .team-card {{
-  background: rgba(255,255,255,0.72);
-  border: 1px solid rgba(46,90,136,0.08);
-  border-radius: 18px;
-  box-shadow: 0 10px 24px rgba(46,90,136,0.10);
-  padding: 18px 22px;
-  backdrop-filter: blur(6px);
-}}
-.big-card {{ padding: 26px 28px; }}
-.team-card-title {{
-  font-weight: 700; color: var(--brand); margin-bottom: 6px; text-align:center;
-}}
-.team-card-names {{ text-align:center; color: var(--text); }}
-/* Titles & Names (sizes overridden by sliders below) */
-.team-title {{ text-align:center; font-size: {title_px if 'title_px' in globals() else 64}px; font-weight: 800; margin: 10px 0 8px 0; color: var(--brand); }}
-.names-line {{ text-align:center; font-size: {names_px if 'names_px' in globals() else 36}px; line-height: 1.9; color: var(--text); }}
-/* Toolbar & badges */
-.navbar {{ display:flex; gap:12px; justify-content:center; align-items:center; margin: 12px 0 16px 0; }}
-.badge {{ font-weight:600; padding:6px 12px; border-radius:999px; border:1px solid rgba(46,90,136,0.25); background:#fff; }}
-/* Streamlit buttons */
-.stButton>button, .stDownloadButton>button {{
-  border-radius: 12px; padding: 0.45rem 0.9rem; border: 1px solid rgba(46,90,136,0.22);
-  background: linear-gradient(180deg, #ffffff, #f2f6fb);
-  color: var(--text); font-weight: 600;
-}}
-.stButton>button:hover, .stDownloadButton>button:hover {{
-  border-color: var(--brand-2); box-shadow: 0 6px 16px rgba(58,124,165,0.18);
-}}
-/* Sidebar tweaks */
-[data-testid="stSidebar"] .block-container {{ padding-top: 0.6rem; }}
+.team-title {text-align:center; font-size: 64px; font-weight: 800; margin: 24px 0 8px 0;}
+.names-line {text-align:center; font-size: 36px; line-height: 1.8;}
+.navbar {display:flex; gap:12px; justify-content:center; align-items:center; margin: 12px 0 24px 0;}
+.badge {font-weight:600; padding:4px 10px; border-radius:999px; border:1px solid #ddd;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,7 +129,8 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
 
     bands = AGE_BANDS
     band_members = {b: [i for i,p in enumerate(people) if p['나이대'] == b] for b in bands}
-    # 나이대 초과: 기본 2/팀, 불가 시 3/팀 허용 - 필요한 3인팀 수 계산
+
+    # 나이대 초과분 계산(기본 2/팀, 불가피 시 3 허용)
     age_counts = {b: len(members) for b, members in band_members.items()}
     age_extra_needed = {b: max(0, cnt - 2*G) for b, cnt in age_counts.items()}
 
@@ -190,12 +140,12 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
         if len(members) > max_per_church*G:
             overload.append((c, len(members), max_per_church*G))
     if overload:
-        msg = "불가능: 일부 교회 인원이 너무 많아(최대 {max_per_church}명/팀) 배치가 불가합니다.\n" + \
+        msg = f"불가능: 일부 교회 인원이 너무 많아(최대 {max_per_church}명/팀) 배치가 불가합니다.\n" + \
               "\n".join([f" - {c}: {cnt}명 > 허용 {cap}명" for c,cnt,cap in overload])
         return None, None, msg, None
     for b, members in band_members.items():
-        if len(members) > 3*G:  # 나이대는 기본 2명, 불가 시 3명 허용
-            msg = "불가능: 일부 나이대 인원이 너무 많아(최대 3명/팀(기본 2명, 불가 시 3명)) 배치가 불가합니다.\n" + \
+        if len(members) > 3*G:  # 나이대는 기존 2명 유지
+            msg = "불가능: 일부 나이대 인원이 너무 많아(최대 2명/팀) 배치가 불가합니다.\n" + \
                   "\n".join([f" - {b}: {len(band_members[b])}명 > 허용 {3*G}명"])
             return None, None, msg, None
 
@@ -228,15 +178,11 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
         sL.append(sl)
         sU.append(su)
 
-
+    
     # 교회: 팀당 최대 max_per_church(하드)
     # 기본 목표는 팀당 <=2, 불가피한 경우에만 3·4 허용(정확히 필요한 만큼만)
     church_is3_flags = []  # cnt==3
     church_is4_flags = []  # cnt==4
-    church_extras_sum = [] # z = is3 + 2*is4 (팀별 초과합)
-    for g in range(G):
-        pass  # placeholder to keep loop variable available
-
     # Per-church per-team variables
     church_cnt = {}  # (c,g) -> IntVar
     church_z = {}    # (c,g) -> IntVar in [0,2]
@@ -271,21 +217,18 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
 
     age_pair_flags = []
 
-    age_is3_flags = []
-    for b in bands:
-        y_vars = []
-        members = band_members[b]
-        for g in range(G):
-            cnt = model.NewIntVar(0, min(3, len(members)), f"band_{b}_{g}")
+    for g in range(G):
+        for b in bands:
+            members = band_members[b]
+            if not members:
+                continue
+            cnt = model.NewIntVar(0, min(2, len(members)), f"band_{b}_{g}")
             model.Add(cnt == sum(x[(i,g)] for i in members))
-            model.Add(cnt <= 3)
-            is3 = model.NewBoolVar(f"is3_band_{b}_{g}")
-            model.Add(cnt == 3).OnlyEnforceIf(is3)
-            model.Add(cnt != 3).OnlyEnforceIf(is3.Not())
-            age_is3_flags.append(is3)
-            y_vars.append(is3)
-        # 필요한 3인 팀 개수만큼 정확히 배치
-        model.Add(sum(y_vars) == int(age_extra_needed[b]))
+            model.Add(cnt <= 2)
+            is_pair = model.NewBoolVar(f"is_band_pair_{b}_{g}")
+            model.Add(cnt == 2).OnlyEnforceIf(is_pair)
+            model.Add(cnt != 2).OnlyEnforceIf(is_pair.Not())
+            age_pair_flags.append(is_pair)
 
     # 목적함수
     rand = random.Random(int(time.time()) % (10**6))
@@ -299,13 +242,17 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
     model.Minimize(
         1000 * sum(sL) + 1000 * sum(sU) +
         5 * sum(church_is4_flags) + 2 * sum(church_is3_flags) +
-        1 * sum(age_is3_flags) +
+        2 * sum(age_pair_flags) +
         1 * sum(noise_terms)
     )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
+    try:
+        solver.parameters.random_seed = int(seed)
+    except Exception:
+        pass
 
     res = solver.Solve(model)
     if res not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -326,8 +273,7 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
 # ------------------------------
 # UI
 # ------------------------------
-st.markdown('<div class="app-header"><h1>교회 매칭 프로그램</h1></div>', unsafe_allow_html=True)
-st.markdown('<div class="app-sub">팀 번호 + 이름(가나다순, “/” 구분) • 균형 매칭</div>', unsafe_allow_html=True)
+st.title("교회 매칭 프로그램 (팀 번호 + 이름만)")
 
 with st.sidebar:
     st.header("설정")
@@ -383,18 +329,6 @@ if df is not None:
     st.info(f"총 {N}명 → 후보 그룹 크기: " + ", ".join(map(str, sorted(sizes))))
     if warn:
         st.warning(warn)
-
-    # ### 진단 패널 (요약)
-    with st.expander("진단 요약 보기", expanded=False):
-        G = len(sizes)
-        st.write(f"팀 수: {G}, 팀 크기: {sorted(sizes)}")
-        # 교회별/나이대별 초과 요약
-        church_counts = df["교회 이름"].fillna("미상").astype(str).str.strip().value_counts().rename_axis("교회").reset_index(name="인원")
-        church_counts["초과필요(z합)"] = (church_counts["인원"] - 2*G).clip(lower=0)
-        st.dataframe(church_counts)
-        age_counts = df["나이대"].value_counts().rename_axis("나이대").reset_index(name="인원").sort_values("나이대")
-        age_counts["초과필요(3인팀수)"] = (age_counts["인원"] - 2*G).clip(lower=0)
-        st.dataframe(age_counts)
 
     if run_btn:
         ph = st.empty()
