@@ -4,25 +4,13 @@ import io
 import math
 import random
 import pandas as pd
-import numpy as np
 import streamlit as st
 from ortools.sat.python import cp_model
 
-# ------------------------------
-# Page setup + CSS
-# ------------------------------
-st.set_page_config(page_title="교회 매칭 프로그램 (팀 번호 + 이름만)", layout="wide")
-st.markdown("""
-<style>
-.team-title {text-align:center; font-size: 64px; font-weight: 800; margin: 24px 0 8px 0;}
-.names-line {text-align:center; font-size: 36px; line-height: 1.8;}
-.navbar {display:flex; gap:12px; justify-content:center; align-items:center; margin: 12px 0 24px 0;}
-.badge {font-weight:600; padding:4px 10px; border-radius:999px; border:1px solid #ddd;}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="매칭 프로그램", layout="wide")
 
 # ------------------------------
-# 가나다순 정렬 키
+# 가나다순 정렬 키 (한글 초중종성 기준)
 # ------------------------------
 BASE, CHOS, JUNG = 0xAC00, 588, 28
 def hangul_key(s: str):
@@ -40,26 +28,22 @@ def hangul_key(s: str):
     return tuple(ks)
 
 # ------------------------------
-# 유틸: 데이터 전처리
+# 전처리
 # ------------------------------
-AGE_BANDS = ["10대","20대","30대","40대","50대","60대+"]
+AGE_BANDS = ["10대","20대","30대","40대","50대","60대","70대"]
 
-def age_to_band(age: int) -> str:
+def age_to_band(age) -> str:
     try:
         a = int(age)
     except Exception:
         return None
-    if a < 20:
-        return "10대"
-    if a < 30:
-        return "20대"
-    if a < 40:
-        return "30대"
-    if a < 50:
-        return "40대"
-    if a < 60:
-        return "50대"
-    return "60대+"
+    if a < 20:  return "10대"
+    if a < 30:  return "20대"
+    if a < 40:  return "30대"
+    if a < 50:  return "40대"
+    if a < 60:  return "50대"
+    if a < 70:  return "60대"
+    return "70대"
 
 def normalize_gender(x):
     if pd.isna(x):
@@ -72,169 +56,153 @@ def normalize_gender(x):
     return None
 
 # ------------------------------
-# 그룹 크기 결정: 6명 고정
+# 팀 크기 결정: 6명 고정
 # ------------------------------
-def choose_group_sizes(N: int, max_offsize: int = 4):
-    # 6인 고정. 총 인원이 6의 배수가 아니면 중단.
+def choose_group_sizes(N: int, max_offsize: int = 0):
     if N % 6 != 0:
         need = 6 - (N % 6)
-        if need == 6:
-            need = 0
-        msg = (
-            f"해결 실패: 6인 고정 규칙상 총원 {N}명은 6의 배수여야 합니다. "
-            f"±{need if need!=0 else 6}명 조정 후 다시 시도하세요."
-        )
-        return None, msg
+        if need == 6: need = 0
+        return None, f"해결 실패: 6인 고정 규칙상 총원 {N}명은 6의 배수여야 합니다. ±{need if need!=0 else 6}명 조정 후 다시 시도하세요."
     G = N // 6
-    sizes = [6] * G
-    return sizes, None
+    return [6]*G, None
 
-def allowed_male_bounds(size):
-    # 6인 전용: 남 2~4 허용
-    return 2, 4
+def allowed_male_bounds(size: int):
+    return 2, 4  # 6인 전용
 
 # ------------------------------
-# OR-Tools CP-SAT 모델
+# 핵심 솔버
 # ------------------------------
-def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
+def solve_assignment(df, seed=0, time_limit=15, max_per_church=4):
     people = df.to_dict('records')
     N = len(people)
-    sizes, warn = choose_group_sizes(N, max_offsize=4)
+    sizes, warn = choose_group_sizes(N)
     if sizes is None:
-        return None, None, "조 크기 계산 실패", None
+        return None, None, warn, None
     G = len(sizes)
 
     males = [i for i,p in enumerate(people) if p['성별'] == '남']
 
+    # Sets
     churches = sorted(df['교회 이름'].fillna("미상").astype(str).unique().tolist())
     church_members = {c: [i for i,p in enumerate(people) if str(p['교회 이름']) == c] for c in churches}
-
-    church_counts = {c: len(members) for c, members in church_members.items()}
-    # 각 교회는 2명/팀을 기본 목표로 하고, 초과 인원은 반드시 배치해야 하는 'extra'로 계산
-    extra_needed = {c: max(0, cnt - 2*G) for c, cnt in church_counts.items()}
 
     bands = AGE_BANDS
     band_members = {b: [i for i,p in enumerate(people) if p['나이대'] == b] for b in bands}
 
-    # 사전 타당성: 교회/나이대 인원수가 max_per_church*G 초과면 불가능
-    overload = []
+    # Precheck (불가능한 경우 조기 종료)
     for c, members in church_members.items():
         if len(members) > max_per_church*G:
-            overload.append((c, len(members), max_per_church*G))
-    if overload:
-        msg = "불가능: 일부 교회 인원이 너무 많아(최대 {max_per_church}명/팀) 배치가 불가합니다.\n" + \
-              "\n".join([f" - {c}: {cnt}명 > 허용 {cap}명" for c,cnt,cap in overload])
-        return None, None, msg, None
+            return None, None, f"불가능: 교회 '{c}' 인원 {len(members)} > 허용 {max_per_church*G}", None
     for b, members in band_members.items():
-        if len(members) > 2*G:  # 나이대는 기존 2명 유지
-            msg = "불가능: 일부 나이대 인원이 너무 많아(최대 2명/팀) 배치가 불가합니다.\n" + \
-                  "\n".join([f" - {b}: {len(band_members[b])}명 > 허용 {2*G}명"])
-            return None, None, msg, None
+        if len(members) > 3*G:
+            return None, None, f"불가능: 나이대 '{b}' 인원 {len(members)} > 허용 {3*G}", None
+
+    # 초과 필요 계산
+    church_counts = {c: len(members) for c, members in church_members.items()}
+    extra_needed = {c: max(0, cnt - 2*G) for c, cnt in church_counts.items()}
+    age_counts = {b: len(members) for b, members in band_members.items()}
+    age_extra_needed = {b: max(0, cnt - 2*G) for b, cnt in age_counts.items()}
 
     model = cp_model.CpModel()
 
+    # 배정 변수
     x = {}
     for i in range(N):
         for g in range(G):
             x[(i,g)] = model.NewBoolVar(f"x_{i}_{g}")
 
-    # 각 사람은 정확히 1개 팀
+    # 각 사람 정확히 1팀
     for i in range(N):
         model.Add(sum(x[(i,g)] for g in range(G)) == 1)
 
-    # 팀 크기 고정
+    # 팀 크기=6 하드
     for g in range(G):
-        model.Add(sum(x[(i,g)] for i in range(N)) == sizes[g])
+        model.Add(sum(x[(i,g)] for i in range(N)) == 6)
 
-    # 성비 제약(유연 슬랙 허용)
-    sL = []
-    sU = []
+    # 성비 제약(유연 슬랙 최소화)
+    sL, sU = [], []
     for g in range(G):
-        mc = model.NewIntVar(0, sizes[g], f"male_{g}")
+        mc = model.NewIntVar(0, 6, f"male_{g}")
         model.Add(mc == sum(x[(i,g)] for i in males))
-        lo, hi = allowed_male_bounds(sizes[g])
-        sl = model.NewIntVar(0, sizes[g], f"sL_{g}")
-        su = model.NewIntVar(0, sizes[g], f"sU_{g}")
+        lo, hi = allowed_male_bounds(6)
+        sl = model.NewIntVar(0, 6, f"sL_{g}")
+        su = model.NewIntVar(0, 6, f"sU_{g}")
         model.Add(mc >= lo - sl)
         model.Add(mc <= hi + su)
-        sL.append(sl)
-        sU.append(su)
+        sL.append(sl); sU.append(su)
 
-    
-    # 교회: 팀당 최대 max_per_church(하드)
-    # 기본 목표는 팀당 <=2, 불가피한 경우에만 3·4 허용(정확히 필요한 만큼만)
-    church_is3_flags = []  # cnt==3
-    church_is4_flags = []  # cnt==4
-    church_extras_sum = [] # z = is3 + 2*is4 (팀별 초과합)
-    for g in range(G):
-        pass  # placeholder to keep loop variable available
-
-    # Per-church per-team variables
-    church_cnt = {}  # (c,g) -> IntVar
-    church_z = {}    # (c,g) -> IntVar in [0,2]
+    # 동일 교회: 기본 ≤2, 불가 시 3·4만 (≤4 하드), 정확히 필요한 만큼
+    zero = model.NewIntVar(0, 0, "zero_const")
+    is4_flags = []
+    shortfall_church = {}
     for c in churches:
         z_vars = []
+        members = church_members[c]
         for g in range(G):
-            members = church_members[c]
             cnt = model.NewIntVar(0, min(max_per_church, len(members)), f"church_{c}_{g}")
             model.Add(cnt == sum(x[(i,g)] for i in members))
-            model.Add(cnt <= max_per_church)
-            church_cnt[(c,g)] = cnt
+            model.Add(cnt <= max_per_church)  # ≤4 하드
 
-            # is3 / is4 booleans
-            is3 = model.NewBoolVar(f"is3_{c}_{g}")
-            is4 = model.NewBoolVar(f"is4_{c}_{g}")
-            model.Add(cnt == 3).OnlyEnforceIf(is3)
-            model.Add(cnt != 3).OnlyEnforceIf(is3.Not())
-            model.Add(cnt == 4).OnlyEnforceIf(is4)
-            model.Add(cnt != 4).OnlyEnforceIf(is4.Not())
-            church_is3_flags.append(is3)
-            church_is4_flags.append(is4)
-
-            # z extras: 0 if cnt<=2, 1 if cnt==3, 2 if cnt==4
-            z = model.NewIntVar(0, 2, f"z_extra_{c}_{g}")
-            model.Add(z == is3 + 2*is4)
-            church_z[(c,g)] = z
+            # z = max(0, cnt-2) ∈ {0,1,2}
+            t = model.NewIntVar(-2, max_per_church-2, f"t_{c}_{g}")
+            model.Add(t == cnt - 2)
+            z = model.NewIntVar(0, 2, f"z_{c}_{g}")
+            model.AddMaxEquality(z, [t, zero])
             z_vars.append(z)
 
-        # 필요한 초과 인원 합을 정확히 맞춤(= 불가피한 경우에만 3/4 허용)
-        need = extra_needed[c]
-        model.Add(sum(z_vars) == need)
+            # is4 for penalty
+            is4 = model.NewBoolVar(f"is4_{c}_{g}")
+            model.Add(cnt == 4).OnlyEnforceIf(is4)
+            model.Add(cnt != 4).OnlyEnforceIf(is4.Not())
+            is4_flags.append(is4)
 
-    age_pair_flags = []
+        s_c = model.NewIntVar(0, int(extra_needed[c]), f"short_c_{c}")
+        shortfall_church[c] = s_c
+        model.Add(sum(z_vars) + s_c == int(extra_needed[c]))
 
-    for g in range(G):
-        for b in bands:
-            members = band_members[b]
-            if not members:
-                continue
-            cnt = model.NewIntVar(0, min(2, len(members)), f"band_{b}_{g}")
+    # 동일 나이대: 기본 ≤2, 불가 시 3만 (≤3 하드), 정확히 필요한 만큼
+    is3_age_flags = []
+    shortfall_age = {}
+    for b in bands:
+        members = band_members[b]
+        y_vars = []
+        for g in range(G):
+            cnt = model.NewIntVar(0, min(3, len(members)), f"band_{b}_{g}")
             model.Add(cnt == sum(x[(i,g)] for i in members))
-            model.Add(cnt <= 2)
-            is_pair = model.NewBoolVar(f"is_band_pair_{b}_{g}")
-            model.Add(cnt == 2).OnlyEnforceIf(is_pair)
-            model.Add(cnt != 2).OnlyEnforceIf(is_pair.Not())
-            age_pair_flags.append(is_pair)
+            model.Add(cnt <= 3)
+            is3 = model.NewBoolVar(f"is3_{b}_{g}")
+            model.Add(cnt == 3).OnlyEnforceIf(is3)
+            model.Add(cnt != 3).OnlyEnforceIf(is3.Not())
+            is3_age_flags.append(is3)
+            y_vars.append(is3)
+        s_b = model.NewIntVar(0, int(age_extra_needed[b]), f"short_b_{b}")
+        shortfall_age[b] = s_b
+        model.Add(sum(y_vars) + s_b == int(age_extra_needed[b]))
 
     # 목적함수
-    rand = random.Random(int(time.time()) % (10**6))
-    noise_terms = []
-    for i in range(N):
-        for g in range(G):
-            w = rand.randint(0, 3)
-            if w > 0:
-                noise_terms.append(w * x[(i,g)])
+    # - shortfall(교회/나이대) 최소화(5000)
+    # - 성비 슬랙 최소화(1000)
+    # - 4명 같은 교회 팀 최소화(5)
+    # - 3명 같은 나이대 팀 약한 벌점(1)
+    rand = random.Random(12345)
+    noise = sum(rand.randint(0,1) * x[(i,g)] for i in range(N) for g in range(G))
 
     model.Minimize(
-        1000 * sum(sL) + 1000 * sum(sU) +
-        5 * sum(church_is4_flags) + 2 * sum(church_is3_flags) +
-        2 * sum(age_pair_flags) +
-        1 * sum(noise_terms)
+        5000 * sum(shortfall_church.values()) +
+        5000 * sum(shortfall_age.values()) +
+        1000 * (sum(sL) + sum(sU)) +
+        5 * sum(is4_age for is4_age in is4_flags) +
+        1 * sum(is3_age_flags) +
+        1 * noise
     )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
+    try:
+        solver.parameters.random_seed = int(seed)
+    except Exception:
+        pass
 
     res = solver.Solve(model)
     if res not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -253,29 +221,16 @@ def solve_assignment(df, seed=0, time_limit=10, max_per_church=4):
     return groups, warn_list, None, sizes
 
 # ------------------------------
-# UI
+# 사이드바 / 실행
 # ------------------------------
-st.title("교회 매칭 프로그램 (팀 번호 + 이름만)")
-
 with st.sidebar:
     st.header("설정")
     uploaded = st.file_uploader("엑셀 업로드 (.xlsx)", type=["xlsx"])
-    time_limit = st.slider("해결 시간 제한(초)", min_value=5, max_value=30, value=10, step=1)
-    MAX_PER_CHURCH = 4  # 분포 분석 결과: 팀당 동일 교회 최대 4명 필요
+    time_limit = st.slider("해결 시간 제한(초)", min_value=5, max_value=60, value=20, step=1)
     run_btn = st.button("🎲 매칭 시작")
 
-# 글자 크기 조절(조화롭게)
-title_px = st.sidebar.slider("제목 글자 크기(px)", 48, 96, 64, 2)
-names_px = st.sidebar.slider("이름 글자 크기(px)", 24, 64, 36, 2)
-st.markdown(f"""
-<style>
-.team-title {{text-align:center; font-size: {title_px}px; font-weight: 800; margin: 24px 0 8px 0;}}
-.names-line {{text-align:center; font-size: {names_px}px; line-height: 1.8;}}
-</style>
-""", unsafe_allow_html=True)
-
-
-st.markdown("필수 컬럼: `이름`, `성별(남/여)`, `교회 이름`, `나이` · 결과는 **팀 번호 + 이름(가나다순, `/` 구분)** 만 표시됩니다.", unsafe_allow_html=True)
+# 본문: 최소 안내
+st.write("필수 컬럼: `이름`, `성별(남/여)`, `교회 이름`, `나이`")
 
 df = None
 if uploaded is not None:
@@ -297,6 +252,7 @@ if df is not None:
         st.error("성별 값 표준화 실패 행이 있습니다. ('남'/'여'만 허용)")
         st.dataframe(df[df["성별"].isna()])
         st.stop()
+
     df["나이대"] = df["나이"].apply(age_to_band)
     if df["나이대"].isna().any():
         st.error("나이 → 나이대 변환 실패 행이 있습니다. (정수 나이 필요)")
@@ -304,81 +260,65 @@ if df is not None:
         st.stop()
 
     N = len(df)
-    sizes, warn = choose_group_sizes(N, max_offsize=4)
+    sizes, warn = choose_group_sizes(N)
     if sizes is None:
-        st.error(warn)
-        st.stop()
-    st.info(f"총 {N}명 → 후보 그룹 크기: " + ", ".join(map(str, sorted(sizes))))
-    if warn:
-        st.warning(warn)
+        st.error(warn); st.stop()
 
     if run_btn:
-        ph = st.empty()
-        for pct in range(0, 101, 7):
-            ph.progress(pct, text="배치 탐색 중...")
-            time.sleep(0.03)
-
-        groups, warn_list, err, sizes = solve_assignment(df, time_limit=time_limit, max_per_church=MAX_PER_CHURCH)
-
+        groups, warn_list, err, sizes = solve_assignment(df, time_limit=time_limit, max_per_church=4)
         if err:
-            st.error(err)
-            st.stop()
-        if warn_list:
-            for w in warn_list:
-                st.warning(w)
+            st.error(err); st.stop()
+        for w in (warn_list or []):
+            st.warning(w)
 
-        people = df.to_dict('records')
-
-        # Prepare names per team (ga-na-da order, " / " join)
+        # 결과 준비: 팀별 이름 "/" 구분, 가나다순
+        people = df.to_dict("records")
         names_per_team = []
-        for g, members in enumerate(groups):
-            team_names = [people[i]['이름'] for i in members]
-            team_names_sorted = sorted(team_names, key=hangul_key)
-            names_per_team.append(" / ".join(team_names_sorted))
+        for g, members in enumerate(groups, start=1):
+            team_names = sorted([people[i]["이름"] for i in members], key=hangul_key)
+            names_per_team.append(" / ".join(team_names))
 
-        # Initialize session state
+        # 상태 저장 및 1팀씩 보기
         st.session_state.assignment_ready = True
         st.session_state.names_per_team = names_per_team
         st.session_state.team_count = len(names_per_team)
         st.session_state.team_idx = 0
         st.session_state.final_view = False
 
+# ------------------------------
 # Viewer
+# ------------------------------
 if st.session_state.get("assignment_ready", False):
-    st.markdown("<div class='navbar'>", unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
-    with c1:
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
         if st.button("◀ 이전 팀"):
             st.session_state.team_idx = (st.session_state.team_idx - 1) % st.session_state.team_count
             st.session_state.final_view = False
-    with c2:
-        if st.button("최종 결과 보기"):
-            st.session_state.final_view = True
-    with c3:
-        st.markdown(f"<span class='badge'>{st.session_state.team_idx+1} / {st.session_state.team_count}팀</span>", unsafe_allow_html=True)
-    with c4:
+    with col2:
+        st.markdown(f"<div style='text-align:center' class='badge'>{st.session_state.team_idx+1} / {st.session_state.team_count}팀</div>", unsafe_allow_html=True)
+    with col3:
         if st.button("다음 팀 ▶"):
             if st.session_state.team_idx < st.session_state.team_count - 1:
                 st.session_state.team_idx += 1
                 st.session_state.final_view = False
             else:
                 st.session_state.final_view = True
-    st.markdown("</div>", unsafe_allow_html=True)
 
     if st.session_state.final_view:
-        st.markdown("<div class='team-title'>최종 결과</div>", unsafe_allow_html=True)
-        for g, names_line_tmp in enumerate(st.session_state.names_per_team, start=1):
-            st.markdown(f"<div class='names-line'><b>팀 {g}</b> — {names_line_tmp}</div>", unsafe_allow_html=True)
+        st.subheader("최종 결과")
+        for idx, line in enumerate(st.session_state.names_per_team, start=1):
+            st.write(f"팀 {idx}")
+            st.markdown(f"<div class='names-line'>{line}</div>", unsafe_allow_html=True)
     else:
-        cur_idx = st.session_state.team_idx
-        st.markdown(f"<div class='team-title'>팀 {cur_idx+1}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='names-line'>{st.session_state.names_per_team[cur_idx]}</div>", unsafe_allow_html=True)
+        idx = st.session_state.team_idx
+        st.write(f"팀 {idx+1}")
+        st.markdown(f"<div class='names-line'>{st.session_state.names_per_team[idx]}</div>", unsafe_allow_html=True)
 
-    # Download
+    # 다운로드 (팀, 이름)
     rows = []
-    for g, names_line_tmp in enumerate(st.session_state.names_per_team):
-        for name in names_line_tmp.split(" / "):
-            rows.append({"팀": g+1, "이름": name})
+    for g, line in enumerate(st.session_state.names_per_team, start=1):
+        for name in line.split(" / "):
+            rows.append({"팀": g, "이름": name})
     out_df = pd.DataFrame(rows)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -386,5 +326,3 @@ if st.session_state.get("assignment_ready", False):
     st.download_button("결과 엑셀 다운로드(팀+이름, 가나다순)", data=buf.getvalue(),
                        file_name="teams_names_only.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
-    st.info("엑셀 업로드 후 '🎲 매칭 시작'을 눌러주세요.")
